@@ -1,31 +1,101 @@
+import time
 import pandas as pd
 from rag_qa import qa_chain  # 复用上面的链
+from typing import List, Dict, Callable
+from rouge_score import rouge_scorer
+import bert_score
 
-# 模拟测试集
-test_cases = [
-    {"question": "一家拥有专利技术的企业拒绝将其关键技术授权给竞争对手，是否必然构成违法？",
-     "expected": "【结论】不必然违法；若存在正当理由（如保护知识产权、商业秘密等），则不构成滥用市场支配地位。 【依据】《中华人民共和国反垄断法》第二十二条第二款：“经营者依照有关知识产权的法律、行政法规规定行使知识产权的行为，不适用本法；但是，经营者滥用知识产权，排除、限制竞争的行为，适用本法。”"},
-    {"question": "两家医疗器械企业合并，合计市场份额超过50%，但未向国务院反垄断执法机构申报，是否违法？",
-     "expected": "【结论】如达到国务院规定的申报标准而未申报，则构成违法实施经营者集中。 【依据】《中华人民共和国反垄断法》第二十六条：“经营者集中达到国务院规定的申报标准的，经营者应当事先向国务院反垄断执法机构申报，未申报的不得实施集中。”"},
-    {"question": "一家大型互联网公司以低于成本的价格在新业务领域持续补贴用户，意图排挤竞争对手，是否可能构成违法？",
-     "expected": "【结论】若其具有市场支配地位且无正当理由，可能构成滥用市场支配地位。 【依据】《中华人民共和国反垄断法》第二十二条第一款第（二）项：“禁止具有市场支配地位的经营者从事下列滥用市场支配地位的行为：……（二）没有正当理由，以低于成本的价格销售商品。”"}
-]
+import re
 
-results = []
-for case in test_cases:
-    output = qa_chain({"query": case["question"]})["result"]
-    # 简单判断是否包含关键词（实际可用 rouge/bert-score）
-    is_correct = case["expected"] in output
-    results.append({
-        "question": case["question"],
-        "expected": case["expected"],
-        "actual": output,
-        "correct": is_correct
-    })
+# 记录开始时间
+start_time = time.time()
 
-df = pd.DataFrame(results)
-accuracy = df["correct"].mean()
-print(f"准确率: {accuracy:.2%}")
+def load_txt_cases(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read().strip()
+    blocks = re.split(r'\n\s*\n', content)
+    cases = []
+    for block in blocks:
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        q = lines[0].replace("【问题】", "").strip()
+        c = lines[1].replace("【结论】", "").strip()
+        cases.append({"question": q, "expected": f"【结论】{c}"})
+    return cases
 
-# 保存结果
-df.to_csv("evaluation_results.csv", index=False)
+# 测试集
+test_cases = load_txt_cases("stu_test_cases.txt")
+
+def keyword_match(expected: str, actual: str) -> bool:
+    """最简单的包含判断（可扩展为模糊匹配等）"""
+    return expected.strip().lower() in actual.strip().lower()
+
+
+def rouge_l_match(expected: str, actual: str, threshold: float = 0.5) -> bool:
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    score = scorer.score(expected, actual)['rougeL'].fmeasure
+    return score >= threshold
+
+
+def bertscore_match(expected: str, actual: str, threshold: float = 0.5, lang: str = 'en') -> bool:
+    P, R, F1 = bert_score.score([actual], [expected], lang=lang, verbose=False)
+    return F1.item() >= threshold
+
+
+def evaluate_qa(
+        test_cases: List[Dict],
+        qa_chain,
+        eval_fn: Callable[[str, str], bool] = keyword_match,
+) -> pd.DataFrame:
+    """
+    通用 QA 评估函数
+
+    Args:
+        test_cases: 测试用例列表，每个包含 "question" 和 "expected"
+        qa_chain: 接受 {"query": ...} 返回 {"result": ...} 的调用对象
+        eval_fn: 评估函数，接收 (expected, actual) -> bool
+
+    Returns:
+        包含结果和准确率的 DataFrame
+    """
+    results = []
+    for case in test_cases:
+        question = case["question"]
+        expected = case["expected"]
+        actual = qa_chain.invoke({"query": question})["result"]
+
+        try:
+            correct = eval_fn(expected, actual)
+        except Exception as e:
+            print(f"评估出错（问题: {question[:50]}...）: {e}")
+            correct = False
+
+        results.append({
+            "question": question,
+            "expected": expected,
+            "actual": actual,
+            "correct": correct
+        })
+
+    df = pd.DataFrame(results)
+    accuracy = df["correct"].mean()
+    print(f"准确率: {accuracy:.2%}")
+    # 保存结果
+    df.to_csv("evaluation_results.csv", index=False)
+
+# # 默认：关键词匹配
+# df1 = evaluate_qa(test_cases, qa_chain)
+
+# 使用 ROUGE-L
+df2 = evaluate_qa(test_cases, qa_chain,
+                      eval_fn=lambda exp, act: rouge_l_match(exp, act, threshold=0.6))
+#
+# # 使用 BERTScore
+# df3 = evaluate_qa(test_cases, qa_chain,
+#                       eval_fn=lambda exp, act: bertscore_match(exp, act, threshold=0.7, lang='zh'))
+
+# 记录结束时间
+end_time = time.time()
+# 计算运行时间
+running_time = end_time - start_time
+print()
+print(f'程序运行时间：{running_time:.2f}秒')
